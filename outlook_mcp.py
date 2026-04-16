@@ -1,4 +1,9 @@
-"""Simplified Outlook MCP Server with three main tools."""
+"""Outlook MCP Server - fork (multi-account allowlist).
+
+Fork of Abhishek-Aditya-bs/Outlook-MCP-Server @ bb641f7.
+Adds: namespace.Accounts enumeration gated by an SMTP allowlist
+(`included_accounts` in config.properties). Fail-closed.
+"""
 
 import asyncio
 import logging
@@ -45,7 +50,10 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="check_mailbox_access",
-            description="Check connection status and access to personal and shared mailboxes with retention policy info",
+            description=(
+                "Check connection status and per-account accessibility for every "
+                "Outlook account on the SMTP allowlist (included_accounts)."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -54,22 +62,47 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_email_chain",
-            description="Searches for emails containing the specified text in BOTH subject and body using exact phrase matching. Retrieves complete email chains with full email bodies for comprehensive analysis. Searches ALL folders in both personal and shared mailboxes. Returns full email content including sender, recipients, timestamps, and complete message bodies. Use specific search terms (error codes, alert identifiers, unique phrases) for best results.",
+            description=(
+                "Search emails containing the specified text in BOTH subject and body "
+                "using exact phrase matching. Searches every Outlook account on the "
+                "SMTP allowlist (included_accounts) unless `accounts` is provided to "
+                "restrict to a subset. Returns full email content with originating-account "
+                "labeling. Use specific search terms (error codes, unique phrases) for "
+                "best results."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "search_text": {
                         "type": "string",
-                        "description": "Exact text pattern to search for in email subject and body. The search looks for this exact phrase."
+                        "description": (
+                            "Exact text pattern to search for in email subject and body. "
+                            "The search looks for this exact phrase."
+                        )
+                    },
+                    "accounts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional list of SMTP addresses to restrict the search to "
+                            "(must be a subset of included_accounts). If omitted, all "
+                            "allowlisted accounts are searched."
+                        )
                     },
                     "include_personal": {
                         "type": "boolean",
-                        "description": "Search personal mailbox (default: true)",
+                        "description": (
+                            "DEPRECATED. Retained for backward compatibility. "
+                            "Ignored when `accounts` is set."
+                        ),
                         "default": True
                     },
                     "include_shared": {
-                        "type": "boolean", 
-                        "description": "Search shared mailbox (default: true)",
+                        "type": "boolean",
+                        "description": (
+                            "DEPRECATED. Retained for backward compatibility. "
+                            "Ignored when `accounts` is set."
+                        ),
                         "default": True
                     }
                 },
@@ -82,26 +115,28 @@ async def list_tools() -> list[types.Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[types.TextContent]:
     """Handle tool calls."""
-    
     logger.info(f"Executing tool: {name}")
-    
+
     try:
         if name == "check_mailbox_access":
             return await handle_check_mailbox_access()
-            
+
         elif name == "get_email_chain":
             search_text = arguments.get("search_text")
             if not search_text:
                 raise ValueError("search_text parameter is required")
-            
+
+            accounts = arguments.get("accounts")
             include_personal = arguments.get("include_personal", True)
             include_shared = arguments.get("include_shared", True)
-            
-            return await handle_get_email_chain(search_text, include_personal, include_shared)
-            
+
+            return await handle_get_email_chain(
+                search_text, accounts, include_personal, include_shared
+            )
+
         else:
             raise ValueError(f"Unknown tool: {name}")
-            
+
     except Exception as e:
         logger.error(f"Error in tool {name}: {e}")
         error_response = {
@@ -116,17 +151,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[types.Text
 async def handle_check_mailbox_access():
     """Handle mailbox access check."""
     logger.info("Checking mailbox access...")
-    
     try:
-        # Check access to mailboxes (non-blocking)
         access_result = await asyncio.to_thread(outlook_client.check_access)
-        
-        # Format response
         formatted_result = format_mailbox_status(access_result)
-        
         logger.info("Mailbox access check completed")
         return [types.TextContent(type="text", text=str(formatted_result))]
-        
     except Exception as e:
         logger.error(f"Error checking mailbox access: {e}")
         error_response = {
@@ -134,42 +163,38 @@ async def handle_check_mailbox_access():
             "message": f"Could not check mailbox access: {str(e)}",
             "troubleshooting": [
                 "Make sure Outlook is running",
-                "Grant permission when security dialog appears", 
-                "Check network connectivity"
+                "Grant permission when security dialog appears",
+                "Verify included_accounts is set in config.properties",
             ]
         }
         return [types.TextContent(type="text", text=str(error_response))]
 
 
-async def handle_get_email_chain(search_text: str, include_personal: bool, include_shared: bool):
+async def handle_get_email_chain(search_text: str, accounts,
+                                 include_personal: bool, include_shared: bool):
     """Handle email search and retrieval."""
     logger.info(f"Searching for emails containing: {search_text}")
-    
     try:
-        # Search for emails in both subject and body (non-blocking)
         emails = await asyncio.to_thread(
             outlook_client.search_emails,
             search_text=search_text,
-            include_personal=include_personal, 
-            include_shared=include_shared
+            accounts=accounts,
+            include_personal=include_personal,
+            include_shared=include_shared,
         )
-        
-        # Format response
         formatted_result = format_email_chain(emails, search_text)
-        
         logger.info(f"Found {len(emails)} emails containing '{search_text}'")
         return [types.TextContent(type="text", text=str(formatted_result))]
-        
     except Exception as e:
         logger.error(f"Error searching emails: {e}")
         error_response = {
-            "status": "error", 
+            "status": "error",
             "search_text": search_text,
             "message": f"Could not search emails: {str(e)}",
             "troubleshooting": [
-                "Verify Outlook connection", 
+                "Verify Outlook connection",
+                "Check that included_accounts is configured",
                 "Use specific search terms for best results",
-                "Ensure mailboxes are accessible"
             ]
         }
         return [types.TextContent(type="text", text=str(error_response))]
@@ -181,7 +206,7 @@ async def list_resources() -> list[types.Resource]:
     return [
         types.Resource(
             uri="outlook-mcp://config",
-            name="Current Configuration", 
+            name="Current Configuration",
             description="Show current configuration settings",
             mimeType="text/plain"
         )
@@ -194,39 +219,44 @@ async def read_resource(uri: str) -> str:
     if uri == "outlook-mcp://config":
         config.show_config()
         return "Configuration displayed in console"
-    else:
-        raise ValueError(f"Unknown resource: {uri}")
+    raise ValueError(f"Unknown resource: {uri}")
 
 
 async def main():
     """Main entry point."""
     print("=" * 60)
-    print("[STARTING] Outlook MCP Server")
+    print("[STARTING] Outlook MCP Server (fork: multi-account allowlist)")
     print("=" * 60)
-    
-    # Show configuration
+
     config.show_config()
-    
-    # Important notes
+
+    allowlist = config.get_list('included_accounts', [])
     print("\n[INFO] Important Notes:")
     print("   * Make sure Microsoft Outlook is running")
-    print("   * Grant permission when security dialog appears")  
-    print("   * Update config.properties with your shared mailbox details")
-    print("   * Server searches ALL folders, not just Inbox")
-    
-    shared_email = config.get('shared_mailbox_email')
-    if not shared_email or 'your-shared-mailbox' in shared_email or 'example.com' in shared_email:
-        print("\n[WARNING] Shared mailbox not configured!")
-        print("   Update 'shared_mailbox_email' in config.properties")
-    
+    print("   * Grant permission when security dialog appears")
+
+    if not allowlist:
+        print("\n[WARNING] included_accounts is empty!")
+        print("   The server will return empty results until SMTP addresses are added")
+        print("   to config.properties (comma-separated).")
+    else:
+        print(f"\n[INFO] SMTP allowlist ({len(allowlist)} account(s)):")
+        for smtp in allowlist:
+            print(f"   * {smtp}")
+
+    # Upstream config key deprecation warning
+    legacy_shared = config.get('shared_mailbox_email')
+    if legacy_shared and 'example.com' not in str(legacy_shared):
+        print("\n[WARNING] 'shared_mailbox_email' is set but is DEPRECATED in this fork.")
+        print("   The value is IGNORED. Migrate to included_accounts.")
+
     print("\n[TOOLS] Available Tools:")
-    print("   1. check_mailbox_access - Test connection and access")
-    print("   2. get_email_chain - Search emails by text in subject AND body")
-    
-    print(f"\n[READY] Server ready! Listening for MCP client connections...")
+    print("   1. check_mailbox_access  - Test connection and per-account access")
+    print("   2. get_email_chain       - Search by phrase across allowlisted accounts")
+
+    print("\n[READY] Server ready! Listening for MCP client connections...")
     print("=" * 60)
-    
-    # Start server
+
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
